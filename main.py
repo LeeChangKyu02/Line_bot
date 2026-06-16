@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Request
 import os
+import json
+import math
 import httpx
 import aiomysql
 from dotenv import load_dotenv
 
-# .env 파일에 숨겨둔 보안 키들을 로드합니다.
 load_dotenv()
 CLOVA_API_KEY = os.getenv("CLOVA_API_KEY")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -21,85 +22,73 @@ DB_CONFIG = {
 app = FastAPI()
 
 # ─────────────────────────────────────────
-# 키워드 설정 (여기에 원하는 키워드 추가)
+# 키워드 설정
 # ─────────────────────────────────────────
-TRIGGER_KEYWORDS = ["(스토어동일)", "(스토어 동일)", "스토어동일", "스토어 동일"]  # ← 원하는 키워드로 수정
+TRIGGER_KEYWORDS = ["(스토어동일)", "(스토어 동일)", "스토어동일", "스토어 동일"]
+
+# 유사도 임계값 설정
+EMBEDDING_THRESHOLD = 0.85   # 1차: 임베딩 코사인 유사도 기준
+LLM_THRESHOLD = 0.90         # 2차: LLM 판단 넘길 후보 기준
 
 
 def extract_matched_keywords(message: str) -> list[str]:
-    """메시지에서 매칭된 키워드 목록 반환"""
     return [kw for kw in TRIGGER_KEYWORDS if kw in message]
 
 
 # ─────────────────────────────────────────
-# DB 함수들
+# 코사인 유사도 계산
 # ─────────────────────────────────────────
-async def get_recent_issues(limit: int = 50):
-    """최근 이슈 목록 조회 (같은 키워드 포함된 것만)"""
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor(aiomysql.DictCursor) as cur:
-        await cur.execute(
-            "SELECT id, message, keyword FROM issues ORDER BY created_at DESC LIMIT %s",
-            (limit,)
-        )
-        rows = await cur.fetchall()
-    conn.close()
-    return rows
-
-
-async def save_issue(user_id: str, message_id: str, message: str, keyword: str) -> int:
-    """새 이슈 저장 (keyword 컬럼 포함)"""
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "INSERT IGNORE INTO issues (user_id, message_id, message, keyword, created_at) VALUES (%s, %s, %s, %s, NOW())",
-            (user_id, message_id, message, keyword)
-        )
-        await conn.commit()
-        new_id = cur.lastrowid
-    conn.close()
-    return new_id
-
-
-async def get_issues_by_keyword(keyword: str, limit: int = 50):
-    """같은 키워드의 기존 이슈만 조회 (비교 범위 축소)"""
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor(aiomysql.DictCursor) as cur:
-        await cur.execute(
-            "SELECT id, message FROM issues WHERE keyword = %s ORDER BY created_at DESC LIMIT %s",
-            (keyword, limit)
-        )
-        rows = await cur.fetchall()
-    conn.close()
-    return rows
-
-
-async def get_issue_by_id(issue_id: int):
-    """ID로 이슈 조회"""
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor(aiomysql.DictCursor) as cur:
-        await cur.execute("SELECT * FROM issues WHERE id = %s", (issue_id,))
-        row = await cur.fetchone()
-    conn.close()
-    return row
+def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 # ─────────────────────────────────────────
-# HyperCLOVA X 유사도 판단
+# HyperCLOVA X 임베딩 API
 # ─────────────────────────────────────────
-async def check_similarity_with_ai(new_message: str, existing_issues: list) -> dict:
-    """HyperCLOVA X로 유사 이슈 판단"""
-    if not existing_issues:
+async def get_embedding(text: str) -> list[float] | None:
+    """HyperCLOVA X 임베딩 벡터 반환"""
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                "https://clovastudio.stream.ntruss.com/testapp/v1/api-tools/embedding/clir-emb-dolphin",
+                headers={
+                    "Authorization": f"Bearer {CLOVA_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"text": text},
+                timeout=10.0,
+            )
+            data = response.json()
+            return data.get("result", {}).get("embedding")
+        except Exception as e:
+            print(f"[임베딩 오류] {e}")
+            return None
+
+
+# ─────────────────────────────────────────
+# HyperCLOVA X LLM 정밀 판단 (2차)
+# ─────────────────────────────────────────
+async def check_similarity_with_llm(new_message: str, candidates: list) -> dict:
+    """유사도 높은 후보만 LLM으로 정밀 판단"""
+    if not candidates:
         return {"isDuplicate": False}
 
     issue_list = "\n".join(
-        [f"[{i+1}] (ID: {issue['id']}) \"{issue['message']}\"" for i, issue in enumerate(existing_issues)]
+        [f"(ID: {c['id']}) \"{c['message']}\"" for c in candidates]
     )
 
     prompt = f"""당신은 고객 문의 중복 여부를 판단하는 AI입니다.
 아래 규칙을 따르세요:
 - 새 문의와 기존 문의의 의미가 유사하면 중복으로 판단합니다.
 - 표현이 달라도 핵심 질문이 같으면 중복입니다.
+- 제품명, 색상, 브랜드가 달라도 같은 유형의 문의면 중복입니다.
+- 예시: "커피를 옷에 쏟았다" = "우유를 옷에 쏟았다" = 중복
+- 예시: "흰 옷에 묻었다" = "검은 옷에 묻었다" = 중복
 - 반드시 JSON 형식으로만 응답하세요.
 
 새 문의: "{new_message}"
@@ -111,36 +100,73 @@ async def check_similarity_with_ai(new_message: str, existing_issues: list) -> d
 {{"isDuplicate": true/false, "matchedId": 일치하는ID또는null, "similarity": 0.0~1.0, "reason": "판단 이유"}}"""
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://clovastudio.stream.ntruss.com/testapp/v1/chat-completions/HCX-003",
-            headers={
-                "Authorization": f"Bearer {CLOVA_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "messages": [{"role": "user", "content": prompt}],
-                "maxTokens": 300,
-                "temperature": 0.1,
-            },
-            timeout=10.0,
+        try:
+            response = await client.post(
+                "https://clovastudio.stream.ntruss.com/testapp/v1/chat-completions/HCX-003",
+                headers={
+                    "Authorization": f"Bearer {CLOVA_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "messages": [{"role": "user", "content": prompt}],
+                    "maxTokens": 300,
+                    "temperature": 0.3,
+                },
+                timeout=10.0,
+            )
+            data = response.json()
+            text = data.get("result", {}).get("message", {}).get("content", "{}")
+            import re
+            clean = re.sub(r"```json|```", "", text).strip()
+            return json.loads(clean)
+        except Exception as e:
+            print(f"[LLM 오류] {e}")
+            return {"isDuplicate": False}
+
+
+# ─────────────────────────────────────────
+# DB 함수
+# ─────────────────────────────────────────
+async def save_issue(user_id: str, message_id: str, message: str, keyword: str, embedding: list[float] | None) -> int:
+    embedding_json = json.dumps(embedding) if embedding else None
+    conn = await aiomysql.connect(**DB_CONFIG)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT IGNORE INTO issues (user_id, message_id, message, keyword, embedding, created_at) VALUES (%s, %s, %s, %s, %s, NOW())",
+            (user_id, message_id, message, keyword, embedding_json)
         )
+        await conn.commit()
+        new_id = cur.lastrowid
+    conn.close()
+    return new_id
 
-    data = response.json()
-    text = data.get("result", {}).get("message", {}).get("content", "{}")
 
-    try:
-        import json, re
-        clean = re.sub(r"```json|```", "", text).strip()
-        return json.loads(clean)
-    except Exception:
-        return {"isDuplicate": False}
+async def get_issues_with_embedding(keyword: str, limit: int = 200) -> list:
+    """같은 키워드의 이슈 + 임베딩 벡터 조회"""
+    conn = await aiomysql.connect(**DB_CONFIG)
+    async with conn.cursor(aiomysql.DictCursor) as cur:
+        await cur.execute(
+            "SELECT id, message, embedding FROM issues WHERE keyword = %s ORDER BY created_at DESC LIMIT %s",
+            (keyword, limit)
+        )
+        rows = await cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def get_issue_by_id(issue_id: int):
+    conn = await aiomysql.connect(**DB_CONFIG)
+    async with conn.cursor(aiomysql.DictCursor) as cur:
+        await cur.execute("SELECT * FROM issues WHERE id = %s", (issue_id,))
+        row = await cur.fetchone()
+    conn.close()
+    return row
 
 
 # ─────────────────────────────────────────
 # LINE 메시지 전송
 # ─────────────────────────────────────────
 async def reply_message(reply_token: str, messages: list):
-    """LINE으로 메시지 응답"""
     async with httpx.AsyncClient() as client:
         await client.post(
             "https://api.line.me/v2/bot/message/reply",
@@ -152,12 +178,72 @@ async def reply_message(reply_token: str, messages: list):
         )
 
 
+async def push_message(user_id: str, messages: list):
+    """개인 DM 전송 (push)"""
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={
+                "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"to": user_id, "messages": messages},
+        )
+
+
+# ─────────────────────────────────────────
+# 유사도 검색 (임베딩 1차 → LLM 2차)
+# ─────────────────────────────────────────
+async def find_duplicate(new_message: str, new_embedding: list[float], keyword: str) -> dict:
+    """
+    1차: 코사인 유사도로 후보 추림
+    2차: 후보 있으면 LLM으로 정밀 판단
+    """
+    existing = await get_issues_with_embedding(keyword, limit=200)
+
+    candidates = []
+    for issue in existing:
+        if not issue["embedding"]:
+            continue
+        try:
+            vec = json.loads(issue["embedding"])
+            sim = cosine_similarity(new_embedding, vec)
+            if sim >= EMBEDDING_THRESHOLD:
+                candidates.append({
+                    "id": issue["id"],
+                    "message": issue["message"],
+                    "similarity": sim
+                })
+        except Exception:
+            continue
+
+    # 유사도 높은 순 정렬
+    candidates.sort(key=lambda x: x["similarity"], reverse=True)
+
+    print(f"[1차 임베딩 필터] 후보 {len(candidates)}건 / 전체 {len(existing)}건")
+
+    if not candidates:
+        return {"isDuplicate": False}
+
+    # LLM 2차 정밀 판단 (상위 5개만)
+    top_candidates = candidates[:5]
+    llm_result = await check_similarity_with_llm(new_message, top_candidates)
+
+    print(f"[2차 LLM 판단] {llm_result}")
+    if llm_result.get("matchedId"):
+        for c in top_candidates:
+            if c["id"] == llm_result["matchedId"]:
+                llm_result["matchedMessage"] = c["message"]
+                break
+    return llm_result
+
+
 # ─────────────────────────────────────────
 # 라우트
 # ─────────────────────────────────────────
 @app.get("/")
 def read_root():
-    return {"status": "NCP 백엔드 서버 구동 중"}
+    return {"status": "LINE 봇 서버 구동 중 (임베딩 + 하이브리드)"}
 
 
 @app.post("/webhook")
@@ -174,42 +260,76 @@ async def line_webhook(request: Request):
         user_message = event["message"]["text"].strip()
         user_id = event["source"]["userId"]
         reply_token = event["replyToken"]
+        source_type = event["source"].get("type", "user")  # "room", "group", "user"
 
         if not user_message:
             continue
 
-        # ✅ 1단계: 키워드 포함 여부 체크
-        matched_keywords = extract_matched_keywords(user_message)
+        # ─────────────────────────────────────────
+        # 단체방 처리: 트리거 확인 후 DB 저장만 (답변 없음)
+        # ─────────────────────────────────────────
+        if source_type in ("room", "group"):
+            matched_keywords = extract_matched_keywords(user_message)
+            if not matched_keywords:
+                continue
 
-        if not matched_keywords:
-            # 키워드 없으면 → 아무 반응 없이 무시 (또는 아래 주석 해제해서 안내 메시지 발송)
-            # await reply_message(reply_token, [{"type": "text", "text": "키워드가 포함된 이슈만 접수됩니다."}])
-            continue
+            primary_keyword = matched_keywords[0]
 
-        # 키워드가 여러 개면 첫 번째 키워드 기준으로 분류
-        primary_keyword = matched_keywords[0]
+            # 임베딩 생성 후 중복 체크
+            embedding = await get_embedding(user_message)
+            if embedding:
+                result = await find_duplicate(user_message, embedding, primary_keyword)
+                if result.get("isDuplicate"):
+                    print(f"[단체방 중복 스킵] keyword={primary_keyword} / user={user_id}")
+                else:
+                    await save_issue(user_id, message_id, user_message, primary_keyword, embedding)
+                    print(f"[단체방 저장] keyword={primary_keyword} / user={user_id}")
+            else:
+                await save_issue(user_id, message_id, user_message, primary_keyword, None)
+                print(f"[단체방 저장-임베딩없음] keyword={primary_keyword} / user={user_id}")
+            # 답변 없음
 
-        # ✅ 2단계: 같은 키워드의 기존 이슈만 가져와서 비교 (토큰 절약)
-        existing_issues = await get_issues_by_keyword(primary_keyword, limit=50)
+        # ─────────────────────────────────────────
+        # 개인 DM 처리: 유사도 검색 후 답변
+        # ─────────────────────────────────────────
+        elif source_type == "user":
+            matched_keywords = extract_matched_keywords(user_message)
+            if not matched_keywords:
+                continue
 
-        # ✅ 3단계: HyperCLOVA X로 중복 판단
-        ai_result = await check_similarity_with_ai(user_message, existing_issues)
+            primary_keyword = matched_keywords[0]
 
-        if ai_result.get("isDuplicate") and ai_result.get("matchedId"):
-            # 중복 이슈 감지 → 텍스트로 간단하게 응답
-            matched = await get_issue_by_id(ai_result["matchedId"])
-            matched_text = matched["message"] if matched else "내용을 불러올 수 없습니다."
-            similarity = int((ai_result.get("similarity") or 0) * 100)
+            # 임베딩 생성
+            new_embedding = await get_embedding(user_message)
+            if not new_embedding:
+                await reply_message(reply_token, [{"type": "text", "text": "임베딩 생성 실패. 잠시 후 다시 시도해주세요."}])
+                continue
 
-            await reply_message(reply_token, [
-                {
-                    "type": "text",
-                    "text": f"⚠️ 비슷한 이슈가 이미 있어요!\n\n유사 이슈: {matched_text}\n유사도: {similarity}%"
-                }
-            ])
+            # 하이브리드 유사도 검색
+            result = await find_duplicate(user_message, new_embedding, primary_keyword)
 
-        else:
-            # 새 이슈 → DB에만 저장, 응답 없음
-            await save_issue(user_id, message_id, user_message, primary_keyword)
+            if result.get("isDuplicate") and result.get("matchedId"):
+                # 중복 이슈 감지
+                matched = await get_issue_by_id(result["matchedId"])
+                if matched:
+                    matched_text = matched["message"]
+                else:
+                    matched_text = result.get("matchedMessage", "내용을 불러올 수 없습니다.")
+                similarity = int((result.get("similarity") or 0) * 100)
+
+                await reply_message(reply_token, [
+                    {
+                        "type": "text",
+                        "text": f"⚠️ 비슷한 이슈가 이미 있어요!\n\n유사 이슈: {matched_text}\n유사도: {similarity}%"
+                    }
+                ])
+            else:
+                # 새 이슈 → DB 저장 + 접수 완료 안내
+                await reply_message(reply_token, [
+                    {
+                        "type": "text",
+                        "text": "✅ 이슈방_인피닉에 공유 후 새 이슈로 등록하세요!"
+                    }
+                ])
 
     return {"status": "success"}
