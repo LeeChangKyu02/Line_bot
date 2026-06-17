@@ -24,16 +24,16 @@ app = FastAPI()
 # ─────────────────────────────────────────
 # 키워드 설정
 # ─────────────────────────────────────────
-TRIGGER_KEYWORDS = ["(스토어동일)", "(스토어 동일)", "스토어동일", "스토어 동일"]
+TRIGGER_KEYWORDS = ["(스토어동일)", "스토어동일", "(스토어재현)", "스토어재현", "(마켓동일)", "마켓동일", "(마켓재현)", "마켓재현", "(store재현)", "store재현", "(store동일)", "store동일"]
+CANONICAL_KEYWORD = "동일이슈"   # 모든 트리거를 하나의 그룹으로 통일
+
+def extract_matched_keywords(message: str) -> list[str]:
+    normalized = message.replace(" ", "")
+    return [kw for kw in TRIGGER_KEYWORDS if kw in normalized]
 
 # 유사도 임계값 설정
 EMBEDDING_THRESHOLD = 0.85   # 1차: 임베딩 코사인 유사도 기준
 LLM_THRESHOLD = 0.90         # 2차: LLM 판단 넘길 후보 기준
-
-
-def extract_matched_keywords(message: str) -> list[str]:
-    return [kw for kw in TRIGGER_KEYWORDS if kw in message]
-
 
 # ─────────────────────────────────────────
 # 코사인 유사도 계산
@@ -141,12 +141,12 @@ async def save_issue(user_id: str, message_id: str, message: str, keyword: str, 
     return new_id
 
 
-async def get_issues_with_embedding(keyword: str, limit: int = 200) -> list:
+async def get_issues_with_embedding(keyword: str, limit: int = 5000) -> list:
     """같은 키워드의 이슈 + 임베딩 벡터 조회"""
     conn = await aiomysql.connect(**DB_CONFIG)
     async with conn.cursor(aiomysql.DictCursor) as cur:
         await cur.execute(
-            "SELECT id, message, embedding FROM issues WHERE keyword = %s ORDER BY created_at DESC LIMIT %s",
+            "SELECT id, message, embedding, created_at FROM issues WHERE keyword = %s ORDER BY created_at DESC LIMIT %s",
             (keyword, limit)
         )
         rows = await cur.fetchall()
@@ -212,7 +212,8 @@ async def find_duplicate(new_message: str, new_embedding: list[float], keyword: 
                 candidates.append({
                     "id": issue["id"],
                     "message": issue["message"],
-                    "similarity": sim
+                    "similarity": sim,
+                    "created_at": issue["created_at"]
                 })
         except Exception:
             continue
@@ -234,6 +235,7 @@ async def find_duplicate(new_message: str, new_embedding: list[float], keyword: 
         for c in top_candidates:
             if c["id"] == llm_result["matchedId"]:
                 llm_result["matchedMessage"] = c["message"]
+                llm_result["matchedCreatedAt"] = c["created_at"]
                 break
     return llm_result
 
@@ -273,7 +275,7 @@ async def line_webhook(request: Request):
             if not matched_keywords:
                 continue
 
-            primary_keyword = matched_keywords[0]
+            primary_keyword = CANONICAL_KEYWORD
 
             # 임베딩 생성 후 중복 체크
             embedding = await get_embedding(user_message)
@@ -290,14 +292,14 @@ async def line_webhook(request: Request):
             # 답변 없음
 
         # ─────────────────────────────────────────
-        # 개인 DM 처리: 유사도 검색 후 답변
+        # 개인 DM 처리: 유사도 검색 후 답변 (저장 X)
         # ─────────────────────────────────────────
         elif source_type == "user":
             matched_keywords = extract_matched_keywords(user_message)
             if not matched_keywords:
                 continue
 
-            primary_keyword = matched_keywords[0]
+            primary_keyword = CANONICAL_KEYWORD
 
             # 임베딩 생성
             new_embedding = await get_embedding(user_message)
@@ -313,18 +315,22 @@ async def line_webhook(request: Request):
                 matched = await get_issue_by_id(result["matchedId"])
                 if matched:
                     matched_text = matched["message"]
+                    matched_time = matched["created_at"]
                 else:
                     matched_text = result.get("matchedMessage", "내용을 불러올 수 없습니다.")
+                    matched_time = result.get("matchedCreatedAt")
+
                 similarity = int((result.get("similarity") or 0) * 100)
+                time_str = matched_time.strftime("%Y-%m-%d %H:%M") if matched_time else "시간 정보 없음"
 
                 await reply_message(reply_token, [
                     {
                         "type": "text",
-                        "text": f"⚠️ 비슷한 이슈가 이미 있어요!\n\n유사 이슈: {matched_text}\n유사도: {similarity}%"
+                        "text": f"⚠️ 비슷한 이슈가 이미 있어요!\n\n유사 이슈: {matched_text}\n등록일시: {time_str}\n유사도: {similarity}%"
                     }
                 ])
             else:
-                # 새 이슈 → DB 저장 + 접수 완료 안내
+                # 새 이슈 → 접수 완료 안내 (DM은 저장하지 않음)
                 await reply_message(reply_token, [
                     {
                         "type": "text",
